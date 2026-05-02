@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+"""Register a face from webcam."""
 import argparse
 from pathlib import Path
 

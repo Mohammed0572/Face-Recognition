@@ -104,9 +104,33 @@ def detect_faces(
 ) -> tuple[list[tuple[int, int, int, int]], list[np.ndarray]]:
     """Return face locations and encodings from an OpenCV BGR frame."""
     rgb_frame = resize_for_recognition(frame, frame_scale)
-    locations = face_recognition.face_locations(rgb_frame, model=model)
-    encodings = face_recognition.face_encodings(rgb_frame, locations)
+    locations = find_face_locations(rgb_frame, model)
+    encodings = encode_face_locations(rgb_frame, locations)
     return locations, encodings
+
+
+def find_face_locations(
+    rgb_frame: np.ndarray,
+    model: str = "hog",
+) -> list[tuple[int, int, int, int]]:
+    """Locate faces in an RGB frame already prepared for face_recognition."""
+    return face_recognition.face_locations(rgb_frame, model=model)
+
+
+def find_face_landmarks(
+    rgb_frame: np.ndarray,
+    locations: Sequence[tuple[int, int, int, int]],
+) -> list[dict[str, list[tuple[int, int]]]]:
+    """Return facial landmarks for already detected face locations."""
+    return face_recognition.face_landmarks(rgb_frame, locations)
+
+
+def encode_face_locations(
+    rgb_frame: np.ndarray,
+    locations: Sequence[tuple[int, int, int, int]],
+) -> list[np.ndarray]:
+    """Compute face encodings only after liveness checks have passed."""
+    return face_recognition.face_encodings(rgb_frame, locations)
 
 
 def scale_location(
