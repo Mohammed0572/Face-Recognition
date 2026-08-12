@@ -7,12 +7,15 @@ from pathlib import Path
 import cv2
 
 from face_utils import (
+    DEFAULT_DETECTION_MODEL,
     DEFAULT_FRAME_SCALE,
+    DEFAULT_PROCESS_EVERY_N_FRAMES,
     ENCODINGS_PATH,
     encode_face_locations,
     draw_face_box,
     find_face_landmarks,
     find_face_locations,
+    limit_to_primary_face,
     load_encodings,
     match_face,
     open_camera,
@@ -50,9 +53,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-m",
         "--model",
-        choices=("hog", "cnn"),
-        default="hog",
-        help="Face detector model. Use cnn only if dlib was built with GPU support.",
+        choices=(DEFAULT_DETECTION_MODEL,),
+        default=DEFAULT_DETECTION_MODEL,
+        help="Face detector model. HOG is used for low-latency real-time CPU detection.",
     )
     parser.add_argument(
         "-t",
@@ -65,7 +68,7 @@ def parse_args() -> argparse.Namespace:
         "--frame-scale",
         type=float,
         default=DEFAULT_FRAME_SCALE,
-        help="Resize factor for faster detection. Must be > 0 and <= 1.",
+        help="Resize factor for faster detection. Default 0.25 processes 25%% frame size.",
     )
     parser.add_argument(
         "--show-distance",
@@ -168,28 +171,85 @@ def main() -> None:
         head_movement_ratio=args.head_movement_threshold,
     )
 
+    frame_index = 0
+    last_locations: list[tuple[int, int, int, int]] = []
+    last_faces_landmarks: list[Landmarks] = []
+    last_liveness = None
+    last_recognition_results: list[
+        tuple[tuple[int, int, int, int], str, tuple[int, int, int]]
+    ] = []
+
     try:
         while True:
             ok, frame = camera.read()
             if not ok:
                 raise RuntimeError("Could not read from webcam.")
 
-            # Step 1: detect face locations before doing any authentication work.
-            rgb_frame = resize_for_recognition(frame, args.frame_scale)
-            locations = find_face_locations(rgb_frame, args.model)
+            # Optimization: only every alternate frame does expensive face work;
+            # skipped frames still display immediately using the cached result.
+            process_current_frame = frame_index % DEFAULT_PROCESS_EVERY_N_FRAMES == 0
+            frame_index += 1
 
-            # Step 2: perform blink/liveness detection from landmarks.
-            faces_landmarks = find_face_landmarks(rgb_frame, locations) if locations else []
-            liveness = liveness_detector.update(
-                faces_landmarks,
-                locations,
-                rgb_frame.shape,
-            )
+            if process_current_frame:
+                # Optimization: shrink to 25% before RGB conversion/detection.
+                rgb_frame = resize_for_recognition(frame, args.frame_scale)
 
+                # Optimization: HOG detection is much faster than CNN for webcam CPU use.
+                detected_locations = find_face_locations(rgb_frame, args.model)
+
+                # Optimization: process only the largest/closest face and ignore extras.
+                locations = limit_to_primary_face(detected_locations)
+
+                faces_landmarks = find_face_landmarks(rgb_frame, locations) if locations else []
+                liveness = liveness_detector.update(
+                    faces_landmarks,
+                    locations,
+                    rgb_frame.shape,
+                    frame_weight=DEFAULT_PROCESS_EVERY_N_FRAMES,
+                )
+
+                recognition_results: list[
+                    tuple[tuple[int, int, int, int], str, tuple[int, int, int]]
+                ] = []
+                if liveness.is_live and locations:
+                    # Step 3: only after liveness is confirmed, compute one face encoding.
+                    encodings = encode_face_locations(rgb_frame, locations)
+
+                    for location, face_encoding in zip(locations, encodings):
+                        name, distance = match_face(
+                            face_encoding,
+                            data["encodings"],
+                            data["names"],
+                            args.tolerance,
+                        )
+                        label = name
+                        if args.show_distance and distance is not None:
+                            label = f"{name} ({distance:.2f})"
+
+                        color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
+                        recognition_results.append((location, label, color))
+
+                    if not recognition_results:
+                        recognition_results.append((locations[0], "Unknown", (0, 0, 255)))
+
+                last_locations = locations
+                last_faces_landmarks = faces_landmarks
+                last_liveness = liveness
+                last_recognition_results = recognition_results
+            else:
+                locations = last_locations
+                faces_landmarks = last_faces_landmarks
+                liveness = last_liveness
+                recognition_results = last_recognition_results
+
+            # Optimization: all drawing and window updates still happen every
+            # frame so the webcam preview stays responsive even while processing.
             for landmarks in faces_landmarks:
                 draw_eye_landmarks(frame, landmarks, args.frame_scale)
 
-            if not locations:
+            if liveness is None:
+                draw_status(frame, "Initializing camera", 80, (255, 255, 255))
+            elif not locations:
                 draw_status(frame, "No face detected", 80, (0, 0, 255))
             elif not liveness.is_live:
                 # No face recognition is performed until the blink challenge passes.
@@ -206,48 +266,35 @@ def main() -> None:
                 else:
                     draw_status(frame, "Fake / No Liveness", 80, (0, 0, 255))
             else:
-                # Step 3: only after liveness is confirmed, compute encodings and match.
-                encodings = encode_face_locations(rgb_frame, locations)
-
-                for location, face_encoding in zip(locations, encodings):
-                    name, distance = match_face(
-                        face_encoding,
-                        data["encodings"],
-                        data["names"],
-                        args.tolerance,
-                    )
-                    label = name
-                    if args.show_distance and distance is not None:
-                        label = f"{name} ({distance:.2f})"
-
-                    color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
+                for location, label, color in recognition_results:
                     draw_face_box(frame, location, label, args.frame_scale, color)
 
                 draw_status(frame, "Real User", 80, (0, 255, 0))
 
-            if liveness.ear is not None:
-                draw_status(frame, f"EAR: {liveness.ear:.2f}", 140, (255, 255, 0))
-            if liveness.blink_detected:
-                draw_status(frame, "Blink Detected", 110, (0, 0, 255))
+            if liveness is not None:
+                if liveness.ear is not None:
+                    draw_status(frame, f"EAR: {liveness.ear:.2f}", 140, (255, 255, 0))
+                if liveness.blink_detected:
+                    draw_status(frame, "Blink Detected", 110, (0, 0, 255))
 
-            draw_status(
-                frame,
-                f"Blinks: {liveness.blink_count}/{args.required_blinks}",
-                50,
-                (255, 255, 255),
-            )
-            draw_status(
-                frame,
-                "Head movement: OK" if liveness.head_moved else "Head movement: needed",
-                170,
-                (0, 255, 0) if liveness.head_moved else (255, 255, 255),
-            )
-            draw_status(
-                frame,
-                f"Time left: {liveness.time_remaining:.1f}s",
-                200,
-                (255, 255, 255),
-            )
+                draw_status(
+                    frame,
+                    f"Blinks: {liveness.blink_count}/{args.required_blinks}",
+                    50,
+                    (255, 255, 255),
+                )
+                draw_status(
+                    frame,
+                    "Head movement: OK" if liveness.head_moved else "Head movement: needed",
+                    170,
+                    (0, 255, 0) if liveness.head_moved else (255, 255, 255),
+                )
+                draw_status(
+                    frame,
+                    f"Time left: {liveness.time_remaining:.1f}s",
+                    200,
+                    (255, 255, 255),
+                )
             draw_status(frame, "Press q to quit")
             cv2.imshow("Face Recognition", frame)
 

@@ -10,7 +10,23 @@ import numpy as np
 
 
 ENCODINGS_PATH = Path(__file__).resolve().with_name("encodings.pkl")
+
+# Optimization: process quarter-size frames so HOG detection and face encodings
+# run on 25% of the original width/height while the full frame remains on screen.
 DEFAULT_FRAME_SCALE = 0.25
+
+# Optimization: keep webcam capture modest so OpenCV has fewer pixels to move,
+# convert, and display on every real-time frame.
+DEFAULT_CAMERA_WIDTH = 640
+DEFAULT_CAMERA_HEIGHT = 480
+
+# Optimization: HOG is much lighter than CNN on CPU webcams and avoids the
+# latency spikes that make live feeds feel delayed.
+DEFAULT_DETECTION_MODEL = "hog"
+
+# Optimization: process every alternate frame and reuse the last result on the
+# skipped frame so the display can keep repainting smoothly.
+DEFAULT_PROCESS_EVERY_N_FRAMES = 2
 
 
 def clean_name(name: str) -> str:
@@ -77,11 +93,24 @@ def save_user_encoding(
     return len(data["names"])
 
 
-def open_camera(camera_index: int = 0) -> cv2.VideoCapture:
+def open_camera(
+    camera_index: int = 0,
+    width: int = DEFAULT_CAMERA_WIDTH,
+    height: int = DEFAULT_CAMERA_HEIGHT,
+) -> cv2.VideoCapture:
     """Open a webcam and fail fast when it is unavailable."""
     camera = cv2.VideoCapture(camera_index)
     if not camera.isOpened():
         raise RuntimeError(f"Could not open webcam at index {camera_index}.")
+
+    # Optimization: ask the webcam for 640x480 frames to reduce capture and
+    # display work before any recognition logic runs.
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    # Optimization: keep the capture buffer short so a slow processed frame
+    # does not leave the UI showing old webcam frames.
+    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return camera
 
 
@@ -99,7 +128,7 @@ def resize_for_recognition(frame: np.ndarray, frame_scale: float) -> np.ndarray:
 
 def detect_faces(
     frame: np.ndarray,
-    model: str = "hog",
+    model: str = DEFAULT_DETECTION_MODEL,
     frame_scale: float = DEFAULT_FRAME_SCALE,
 ) -> tuple[list[tuple[int, int, int, int]], list[np.ndarray]]:
     """Return face locations and encodings from an OpenCV BGR frame."""
@@ -111,10 +140,23 @@ def detect_faces(
 
 def find_face_locations(
     rgb_frame: np.ndarray,
-    model: str = "hog",
+    model: str = DEFAULT_DETECTION_MODEL,
 ) -> list[tuple[int, int, int, int]]:
     """Locate faces in an RGB frame already prepared for face_recognition."""
     return face_recognition.face_locations(rgb_frame, model=model)
+
+
+def limit_to_primary_face(
+    locations: Sequence[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    """Return only the largest detected face for real-time processing."""
+    if not locations:
+        return []
+
+    # Optimization: landmark and encoding work scales with face count, so keep
+    # only the largest/closest face and ignore bystanders.
+    primary = max(locations, key=_face_area)
+    return [primary]
 
 
 def find_face_landmarks(
@@ -147,6 +189,11 @@ def scale_location(
         int(bottom * scale),
         int(left * scale),
     )
+
+
+def _face_area(location: Sequence[int]) -> int:
+    top, right, bottom, left = location
+    return max(0, right - left) * max(0, bottom - top)
 
 
 def draw_face_box(

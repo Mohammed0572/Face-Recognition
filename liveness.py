@@ -118,8 +118,12 @@ class BlinkLivenessDetector:
         face_locations: Sequence[FaceLocation] | None = None,
         frame_shape: FrameShape | None = None,
         now: float | None = None,
+        frame_weight: int = 1,
     ) -> LivenessResult:
         """Process current face landmarks and return the latest liveness result."""
+        if frame_weight < 1:
+            raise ValueError("Frame weight must be at least 1.")
+
         current_time = monotonic() if now is None else now
         landmarks_list = list(faces_landmarks)
         locations = list(face_locations or [])
@@ -133,7 +137,7 @@ class BlinkLivenessDetector:
 
         face_detected = primary_landmarks is not None or primary_location is not None
         if not face_detected:
-            return self._handle_missing_face(current_time)
+            return self._handle_missing_face(current_time, frame_weight)
 
         self.missing_face_frames = 0
         if self.challenge_started_at is None:
@@ -158,7 +162,7 @@ class BlinkLivenessDetector:
 
         ear = average_eye_aspect_ratio(primary_landmarks) if primary_landmarks else None
         eyes_closed = ear is not None and ear < self.ear_threshold
-        blink_detected = self._update_blink_count(eyes_closed)
+        blink_detected = self._update_blink_count(eyes_closed, frame_weight)
 
         head_movement = 0.0
         if primary_location is not None and frame_shape is not None:
@@ -179,10 +183,12 @@ class BlinkLivenessDetector:
             face_detected=True,
         )
 
-    def _update_blink_count(self, eyes_closed: bool) -> bool:
+    def _update_blink_count(self, eyes_closed: bool, frame_weight: int = 1) -> bool:
         """Count blinks only after a valid closed-eye run has ended."""
         if eyes_closed:
-            self.closed_frames += 1
+            # Optimization support: when real-time loops skip alternate frames,
+            # count the skipped frame too so blink duration thresholds stay stable.
+            self.closed_frames += frame_weight
             return False
 
         blink_frames = self.closed_frames
@@ -209,9 +215,9 @@ class BlinkLivenessDetector:
             self.head_moved = True
         return movement
 
-    def _handle_missing_face(self, current_time: float) -> LivenessResult:
+    def _handle_missing_face(self, current_time: float, frame_weight: int = 1) -> LivenessResult:
         """Allow brief detector flicker, then reset the challenge if face is gone."""
-        self.missing_face_frames += 1
+        self.missing_face_frames += frame_weight
         if self.missing_face_frames > self.max_missing_frames:
             self.reset()
 
